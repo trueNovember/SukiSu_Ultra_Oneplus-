@@ -1419,6 +1419,17 @@ echo "  arch.h: re-added PT_REGS_SYSCALL_PARM1 (identity on arm64/x86_64)"
 's|int magic1 = (int)PT_REGS_PARM1(real_regs);|int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);|' \
 "$k/supercall/supercall.c" || true
 
+  # SukiSU adds two pr_info() lines in setuid_hook.c that official tiann/KernelSU
+  # does not have. They sit inside the hunks the enable patch rewrites, so their
+  # extra lines make the whole setresuid rewrite REJECT. Drop them (pure logging)
+  # and collapse the surplus blank line so the rewrite applies cleanly, exactly as
+  # it does against official.
+  if [ -f "$k/hook/setuid_hook.c" ]; then
+    perl -0pi -e 's/\n    pr_info\("handle_setresuid from %d to %d\\n", old_uid, new_uid\);\n\n/\n/' "$k/hook/setuid_hook.c"
+    perl -0pi -e 's/\n        pr_info\("install fd for manager: %d\\n", new_uid\);\n/\n/' "$k/hook/setuid_hook.c"
+    echo "  setuid_hook.c: dropped SukiSU-only pr_info() lines"
+  fi
+
   if [ -f "$k/feature/sucompat.c" ]; then
 sed -i \
   -e 's|(int)PT_REGS_PARM1(regs) != AT_FDCWD|(int)PT_REGS_SYSCALL_PARM1(regs) != AT_FDCWD|' \
@@ -1469,6 +1480,11 @@ EXPECTED_SUKISU_REJECTS=(
   # v2.3.0: only hunk is pr_err/pr_info wording inside official's
   # ksu_install_fd_with_permissions(), a function SukiSU does not have.
   "kernel/supercall/supercall.c.rej"
+  # v2.3.0: the only hunk adds susfs_parse_priority_app_strings() under
+  # CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER (NOT enabled in this build) and anchors
+  # on ksu_track_throne_tw_func() — a task_work callback SukiSU refactored away
+  # (throne tracking is synchronous here). Nothing to apply; drop the reject.
+  "kernel/manager/pkg_observer.c.rej"
 )
 
 if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
