@@ -1455,6 +1455,35 @@ sed -i 's|^extern bool allow_shell;|&\n#ifdef MODULE\nextern bool ksu_bundled;\n
   fi
 }
 
+fix_sukisu_rules_c() {
+  local target="$1"
+  [ -f "$target" ] || return 0
+
+  echo "Fixing SukiSU rules.c SUSFS batch-SID wiring in: $target"
+
+  if grep -q 'susfs_set_batch_sid[[:space:]]*();' "$target"; then
+    echo "  susfs_set_batch_sid() already wired in $target"
+    return 0
+  fi
+
+  # The enable patch's rules.c hunks REJECT on SukiSU because reset_avc_cache()
+  # already takes no seqno arg and latest_granting is already gone, so GNU patch
+  # reports "Reversed (or previously applied) patch detected" and skips the WHOLE
+  # hunk — including the one change SukiSU is genuinely missing: the
+  # susfs_set_batch_sid() call in apply_kernelsu_rules(). Wire it in after the
+  # reset_avc_cache() that immediately precedes out_unlock: (handle_sepolicy()
+  # does NOT call it). susfs_set_batch_sid() itself is defined by the enable
+  # patch's kernel/selinux/selinux.c hunk.
+  perl -0pi -e 's/(    reset_avc_cache\(\);\n)(out_unlock:)/$1\n    susfs_set_batch_sid();\n$2/' "$target"
+
+  if ! grep -q 'susfs_set_batch_sid[[:space:]]*();' "$target"; then
+    echo "::error::susfs_set_batch_sid() was not wired into $target"
+    exit 1
+  fi
+
+  echo "✅ wired susfs_set_batch_sid() into $target"
+}
+
 # =============================================================================
 # Patch KernelSU tree
 # =============================================================================
@@ -1485,6 +1514,11 @@ EXPECTED_SUKISU_REJECTS=(
   # on ksu_track_throne_tw_func() — a task_work callback SukiSU refactored away
   # (throne tracking is synchronous here). Nothing to apply; drop the reject.
   "kernel/manager/pkg_observer.c.rej"
+  # v2.3.0: rules.c already carries the no-arg reset_avc_cache() and has
+  # latest_granting removed, so GNU patch skips the whole hunk as "already
+  # applied". The one genuinely-missing change — susfs_set_batch_sid() — is
+  # wired in by fix_sukisu_rules_c() above.
+  "kernel/selinux/rules.c.rej"
 )
 
 if [ -n "$(find . -name '*.rej' -print -quit)" ]; then
@@ -1578,6 +1612,7 @@ fix_sukisu_dispatch_c           "kernel/supercall/dispatch.c"
 fix_sukisu_sucompat_api         "kernel"
 fix_sukisu_forced_execveat_link_symbols "kernel"
 fix_sukisu_syscall_event_bridge "kernel/hook/syscall_event_bridge.c"
+fix_sukisu_rules_c               "kernel/selinux/rules.c"
 fix_sukisu_linker_symbols
 
 # =============================================================================
@@ -1629,6 +1664,7 @@ fix_sukisu_dispatch_c           "drivers/kernelsu/supercall/dispatch.c"
 fix_sukisu_sucompat_api         "drivers/kernelsu"
 fix_sukisu_forced_execveat_link_symbols "drivers/kernelsu"
 fix_sukisu_syscall_event_bridge "drivers/kernelsu/hook/syscall_event_bridge.c"
+fix_sukisu_rules_c               "drivers/kernelsu/selinux/rules.c"
 
 replicate_susfs_hook_subsystem_removal "$KSU_FOLDER/kernel/Kbuild"
 replicate_susfs_hook_subsystem_removal "drivers/kernelsu/Kbuild"
