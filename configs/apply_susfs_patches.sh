@@ -281,6 +281,10 @@ fix_sukisu_ksud_integration_c() {
 
   neutralize_ksu_late_loaded "$target"
 
+  # The converted code (static keys, static_branch_*) needs jump_label.h; SukiSU's
+  # ksud_integration.c does not pull it in transitively.
+  grep -q '#include <linux/jump_label.h>' "$target" || sed -i '1i#include <linux/jump_label.h>' "$target"
+
   # SUSFS v2.3.0 rewrites ksu_handle_execveat_ksud() to the hooked signature. ksud.h and
   # sucompat.c take the new one, but the hunk converting the definition rejects against
   # SukiSU, which still has the syscall-table form plus its own module-blacklist and
@@ -361,6 +365,129 @@ body = body[:-1] + "\n    return 0;\n}\n"
 path.write_text(text[:m.start()] + body + text[end:])
 print("ksu_handle_execveat_ksud() converted to the hooked signature")
 KSUDPY
+
+  # ---------------------------------------------------------------------------
+  # SUSFS v2.3.0 drops KernelSU's whole syscall-hook/kprobe machinery from this
+  # file (the enable patch removes ksu_execve_hook_ksud*, ksu_sys_read,
+  # ksu_sys_fstat and the input kprobe, and turns ksu_sys_fstat into
+  # ksu_handle_vfs_fstat() which the kernel-side VFS fstat hook calls directly).
+  # Those hunks reject against SukiSU, so reconcile them idempotently here.
+  # ---------------------------------------------------------------------------
+  KSUD_INTEGRATION_C="$target" python3 <<'KSUDPY2'
+import os, re, sys
+from pathlib import Path
+
+path = Path(os.environ["KSUD_INTEGRATION_C"])
+text = path.read_text()
+
+def remove_block(text, sig):
+    m = re.search(re.escape(sig), text)
+    if not m:
+        return text
+    brace = text.index('{', m.start())
+    depth = 0
+    i = brace
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    end = i + 1
+    start = text.rfind('\n', 0, m.start()) + 1
+    j = end
+    while j < len(text) and text[j] in ' \t':
+        j += 1
+    if j < len(text) and text[j] == ';':
+        j += 1
+    while j < len(text) and text[j] == '\n':
+        j += 1
+    return text[:start] + text[j:]
+
+for sig in [
+    'static void ksu_execve_hook_ksud_common(const char __user *filename_user, const char __user *const __user *argv_user)',
+    'void ksu_execve_hook_ksud(const struct pt_regs *regs)',
+    'void ksu_execveat_hook_ksud(const struct pt_regs *regs)',
+]:
+    text = remove_block(text, sig)
+
+text = re.sub(r'\nstatic long \(\*orig_sys_read\)\(const struct pt_regs \*regs\);\n', '\n', text)
+text = remove_block(text, 'static long ksu_sys_read(const struct pt_regs *regs)')
+
+text = re.sub(r'\nstatic long \(\*orig_sys_fstat\)\(const struct pt_regs \*regs\);\n', '\n', text)
+
+m = re.search(r'\n(?:static long ksu_sys_fstat\(const struct pt_regs \*regs\)|void ksu_handle_vfs_fstat\(int fd, loff_t \*kstat_size_ptr\))\n\{', text)
+if m:
+    start = m.start() + 1
+    brace = text.index('{', m.start())
+    depth = 0; i = brace
+    while i < len(text):
+        if text[i] == '{': depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0: break
+        i += 1
+    end = i + 1
+    new_fn = ('void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)\n'
+              '{\n'
+              '    loff_t orig_size = *kstat_size_ptr;\n'
+              '    size_t extra = 0;\n'
+              '    bool is_rc = false;\n'
+              '    struct file *file = fget(fd);\n'
+              '\n'
+              '    if (file) {\n'
+              '        if (is_init_rc(file)) {\n'
+              '            pr_info("stat init.rc");\n'
+              '            is_rc = true;\n'
+              '            load_module_rc_once();\n'
+              '        }\n'
+              '        fput(file);\n'
+              '    }\n'
+              '\n'
+              '    if (is_rc) {\n'
+              '        extra = ksu_rc_len + module_rc_len;\n'
+              '        *kstat_size_ptr = orig_size + extra;\n'
+              '        pr_info("adding rc len: %lld -> %lld (static=%zu module=%zu)", orig_size, *kstat_size_ptr, ksu_rc_len, module_rc_len);\n'
+              '    }\n'
+              '}')
+    text = text[:start] + new_fn + text[end:]
+
+text = re.sub(
+    r'int ksu_handle_input_handle_event\(unsigned int \*type, unsigned int \*code, int \*value\)\n\{.*?\n\}\n',
+    ('int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value)\n'
+     '{\n'
+     '    if (*type == EV_KEY && *code == KEY_VOLUMEDOWN) {\n'
+     '        int val = *value;\n'
+     '        if (val) {\n'
+     '            if (is_volumedown_enough(volumedown_pressed_count))\n'
+     '                return 0;\n'
+     '            volumedown_pressed_count += 1;\n'
+     '        }\n'
+     '    }\n'
+     '\n'
+     '    return 0;\n'
+     '}\n'),
+    text, flags=re.S)
+
+for sig in [
+    'static int input_handle_event_handler_pre(struct kprobe *p, struct pt_regs *regs)',
+    'static struct kprobe input_event_kp =',
+    'static void do_stop_input_hook(struct work_struct *work)',
+    'static void stop_init_rc_hook()',
+    'void ksu_stop_input_hook_runtime(void)',
+]:
+    text = remove_block(text, sig)
+
+text = re.sub(r'void __init ksu_ksud_init\(\)\n\{.*?\n\}\n', 'void __init ksu_ksud_init()\n{\n}\n', text, flags=re.S)
+text = re.sub(r'void __exit ksu_ksud_exit\(\)\n\{.*?\n\}\n', 'void __exit ksu_ksud_exit()\n{\n    if (module_rc_buf) {\n        free_module_rc();\n    }\n}\n', text, flags=re.S)
+
+text = re.sub(r'\n;[ \t]*\n', '\n', text)
+
+path.write_text(text)
+print("ksud_integration.c: removed SUSFS-removed hooks + converted ksu_sys_fstat")
+KSUDPY2
 
   if ! grep -q 'ksu_no_custom_rc' "$target"; then
 echo "ℹ️ ksu_no_custom_rc not referenced in $target"
